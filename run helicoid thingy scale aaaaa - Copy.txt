@@ -1,0 +1,35 @@
+(.venv) PS C:\Users\iampi\dev\helicoid_scale> pwd
+
+Path
+----
+C:\Users\iampi\dev\helicoid_scale
+
+
+(.venv) PS C:\Users\iampi\dev\helicoid_scale> .\.venv\Scripts\activate.ps1
+(.venv) PS C:\Users\iampi\dev\helicoid_scale> pythonfocusscale.py
+pythonfocusscale.py : The term 'pythonfocusscale.py' is not recognized as the name of a cmdlet, function, script file, or
+operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:1 char:1
++ pythonfocusscale.py
++ ~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (pythonfocusscale.py:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(.venv) PS C:\Users\iampi\dev\helicoid_scale> python focusscale.py
+C:\Users\iampi\dev\helicoid_scale\.venv\Scripts\python.exe: can't open file 'C:\\Users\\iampi\\dev\\helicoid_scale\\focusscale.py': [Errno 2] No such file or directory
+(.venv) PS C:\Users\iampi\dev\helicoid_scale> python focus_scale.py
+
+
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA new section
+
+#pwd = present working directory
+
+#open powershell
+
+cd C:\Users\iampi\dev\helicoid_scale 
+
+#activate the virtual environment 
+.\.venv\Scripts\activate.ps1
+
+#python file name:run the progam  
+python focus_scale.py
