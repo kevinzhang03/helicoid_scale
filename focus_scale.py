@@ -442,12 +442,13 @@ class FocusingScaleGenerator:
         dpi: int = 300,
         height: float = 3.0,
         tick_length: float = 0.5,
+        tick_width: float = 0.17,
         padding: float = 0.3,
         vertical_offset: float = 0.5,
         target_distances: Optional[list[float]] = None,
         page_size: str = "Letter",
         mark_mode: str = "fixed",
-        min_gap_mm: float = 3.5,
+        min_gap_mm: float = 0.8,
         min_rel: float = 0.08,
         min_abs_m: float = 0.05,
         text_color: str = DEFAULT_TEXT_COLOR,
@@ -469,7 +470,12 @@ class FocusingScaleGenerator:
         self.ffd = ffd
         self.dpi = dpi
         self.height = height
+        if tick_length <= 0:
+            raise ValueError("Tick height must be > 0 mm")
+        if tick_width <= 0:
+            raise ValueError("Tick width must be > 0 mm")
         self.tick_length = tick_length
+        self.tick_width = tick_width
         self.padding = padding
         self.vertical_offset = vertical_offset
         self.target_distances = target_distances or list(DEFAULT_TARGET_DISTANCES)
@@ -582,10 +588,56 @@ class FocusingScaleGenerator:
         ]
         return [d for d in palette if near_m + 1e-6 < d < far_cap - 1e-9]
 
+    def _pixels_to_mm(self, px: float) -> float:
+        return px * 25.4 / self.dpi
+
+    def _measure_text_width_mm(self, text: str, font: ImageFont.ImageFont) -> float:
+        """Measure rendered label width in mm using the actual font glyphs."""
+        try:
+            bbox = font.getbbox(text)
+            ink_px = max(0.0, float(bbox[2] - bbox[0]))
+        except Exception:
+            ink_px = 0.0
+        advance_px = 0.0
+        if hasattr(font, "getlength"):
+            try:
+                advance_px = float(font.getlength(text))
+            except Exception:
+                advance_px = 0.0
+        width_px = max(ink_px, advance_px)
+        if width_px <= 0:
+            width_px = max(1.0, float(len(text) * self.font_size * 0.55))
+        return self._pixels_to_mm(width_px)
+
+    def _label_half_width_mm(self, distance: float, font: ImageFont.ImageFont) -> float:
+        return self._measure_text_width_mm(
+            self._format_distance_text(distance), font
+        ) / 2.0
+
+    def _marks_too_close(
+        self,
+        x1: float,
+        d1: float,
+        x2: float,
+        d2: float,
+        font: ImageFont.ImageFont,
+        clearance_mm: float,
+    ) -> bool:
+        """
+        True if centered labels would overlap (or come closer than clearance).
+        Uses measured glyph widths for the active font/size.
+        """
+        need = (
+            self._label_half_width_mm(d1, font)
+            + self._label_half_width_mm(d2, font)
+            + clearance_mm
+        )
+        return abs(x1 - x2) < need
+
     def _dynamic_target_distances(self) -> list[float]:
         """
         Choose marks from nice distances using:
-          - minimum physical spacing along the scale (label room)
+          - label collision from measured font glyph widths + clearance
           - minimum focus-distance delta (relative or absolute)
         Far marks are placed first so the cramped infinity end isn't overcrowded.
         """
@@ -595,29 +647,39 @@ class FocusingScaleGenerator:
         # Far end of the *printed* strip (∞ when positive error adds a pre-buffer)
         far_m = self.object_distance_from_extension(self.scale_ext_min)
 
-        # Tunable thresholds (GUI sliders)
-        min_gap_mm = self.min_gap_mm
+        clearance_mm = self.min_gap_mm
         min_rel = self.min_rel
         min_abs = self.min_abs_m
+        font = self._load_font(self.font_size)
 
         candidates = self._nice_distance_candidates(near_m, far_m)
         placed_x: list[float] = []
         placed_d: list[float] = []
 
         # Reserve space for infinity (if present) and the terminal tip
+        reserved: list[tuple[float, float]] = []
         e_inf = self.infinity_extension()
-        reserved: list[float] = []
         if self._extension_on_scale(e_inf):
-            reserved.append(self._x_from_extension(e_inf))
-        reserved.append(self.scale_length)
+            reserved.append((self._x_from_extension(e_inf), float("inf")))
+        near_tip = self.object_distance_from_extension(self.max_extension)
+        if near_tip != float("inf"):
+            reserved.append((self.scale_length, round(near_tip * 100.0) / 100.0))
+        else:
+            reserved.append((self.scale_length, near_m))
 
         for d in sorted(candidates, reverse=True):  # far → near
             x = self._x_for_distance(d)
             if x is None:
                 continue
-            if any(abs(x - rx) < min_gap_mm for rx in reserved):
+            if any(
+                self._marks_too_close(x, d, rx, rd, font, clearance_mm)
+                for rx, rd in reserved
+            ):
                 continue
-            if any(abs(x - px) < min_gap_mm for px in placed_x):
+            if any(
+                self._marks_too_close(x, d, px, pd, font, clearance_mm)
+                for px, pd in zip(placed_x, placed_d)
+            ):
                 continue
             if placed_d:
                 # Compare to physically nearest already-placed mark
@@ -718,10 +780,11 @@ class FocusingScaleGenerator:
     ) -> None:
         width_px, height_px = image_dims
         tick_length_px = self._mm_to_pixels(self.tick_length)
+        tick_width_px = max(1, self._mm_to_pixels(self.tick_width))
         vertical_offset_px = self._mm_to_pixels(self.vertical_offset)
 
         for i, (x_mm, distance) in enumerate(zip(x_positions, distances)):
-            stroke = 2
+            stroke = tick_width_px
             max_x = width_px - 1 - stroke // 2
             x_px = min(self._mm_to_pixels(x_mm), max_x)
             if x_px < 0:
@@ -1319,11 +1382,13 @@ DEFAULTS = {
     "wrap_buffer": "5",
     "page_size": "Letter",
     "mark_mode": "fixed",
-    "min_gap_mm": 3.5,
+    "min_gap_mm": 0.8,
     "min_rel": 0.08,
     "min_abs_m": 0.05,
     "text_color": DEFAULT_TEXT_COLOR,
     "tick_color": DEFAULT_TICK_COLOR,
+    "tick_height": "0.5",
+    "tick_width": "0.17",
     "color_stripe": True,
     "stripe_color": DEFAULT_STRIPE_COLOR,
     "font_name": DEFAULT_FONT_NAME,
@@ -1398,7 +1463,8 @@ OPTION_INFO = {
     "mark_mode": (
         "fixed: place marks only at the distances you list.\n\n"
         "dynamic: pick nice round distances automatically, then thin them "
-        "using min spacing and focus-distance deltas so labels don’t crowd."
+        "using measured label widths (for the selected font/size), label "
+        "clearance, and focus-distance deltas so labels don’t crowd."
     ),
     "reset_mode": (
         "Restore defaults for the current mark mode only.\n\n"
@@ -1407,6 +1473,13 @@ OPTION_INFO = {
     ),
     "text_color": "Colour of the distance numbers on the black scale strip.",
     "tick_color": "Colour of the tick marks under each distance.",
+    "tick_height": (
+        "Height of each tick mark from the bottom of the strip (mm) at 1:1."
+    ),
+    "tick_width": (
+        "Stroke width of each tick mark (mm) at 1:1.\n\n"
+        "Default ≈ 0.17 mm (about 2 px at 300 DPI)."
+    ),
     "color_stripe": (
         "When on, the 5 mm glue tab uses your stripe colour (angled hatch).\n"
         "When off, the tab is neutral grey. The tab is never part of the "
@@ -1423,7 +1496,8 @@ OPTION_INFO = {
     "font_size": (
         "Label size in pixels at 300 DPI.\n\n"
         "Independent of scale height. If the font is taller than the strip, "
-        "glyphs will clip."
+        "glyphs will clip. In dynamic mode, spacing uses measured widths at "
+        "this size."
     ),
     "font_bold": "Draw distance labels with the bold cut of the selected font when available.",
     "fixed_distances": (
@@ -1434,8 +1508,11 @@ OPTION_INFO = {
         "∞ and the near-limit end mark are always added."
     ),
     "min_gap": (
-        "Dynamic mode: minimum physical gap along the strip between marks (mm).\n\n"
-        "Higher → fewer marks, less label collision."
+        "Dynamic mode: extra clearance between label boxes (mm).\n\n"
+        "Required centre-to-centre spacing is computed from the real glyph "
+        "widths of each label in the selected font (so “30” needs more room "
+        "than “3”, and “1” less than “6”), plus this clearance. "
+        "Higher → fewer marks."
     ),
     "min_rel": (
         "Dynamic mode: a candidate mark is kept only if focus distance changed "
@@ -1589,6 +1666,8 @@ class App(tk.Tk):
 
         self.text_color = tk.StringVar(value=str(DEFAULTS["text_color"]))
         self.tick_color = tk.StringVar(value=str(DEFAULTS["tick_color"]))
+        self.tick_height = tk.StringVar(value=str(DEFAULTS["tick_height"]))
+        self.tick_width = tk.StringVar(value=str(DEFAULTS["tick_width"]))
         self.stripe_color = tk.StringVar(value=str(DEFAULTS["stripe_color"]))
         self.color_stripe = tk.BooleanVar(value=bool(DEFAULTS["color_stripe"]))
         self.font_name = tk.StringVar(value=str(DEFAULTS["font_name"]))
@@ -1669,6 +1748,21 @@ class App(tk.Tk):
         bold_cb.pack(side="left", padx=(12, 0))
         self._info_icon(r2, "font_bold").pack(side="left", padx=(4, 0))
 
+        r3 = ttk.Frame(appearance)
+        r3.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self._option_label(r3, "Tick height", "tick_height").pack(side="left")
+        ttk.Entry(r3, textvariable=self.tick_height, width=6).pack(
+            side="left", padx=(8, 4)
+        )
+        ttk.Label(r3, text="mm").pack(side="left")
+        self._option_label(r3, "Tick width", "tick_width").pack(
+            side="left", padx=(16, 0)
+        )
+        ttk.Entry(r3, textvariable=self.tick_width, width=6).pack(
+            side="left", padx=(8, 4)
+        )
+        ttk.Label(r3, text="mm").pack(side="left")
+
         # --- mark mode panels ---
         marks = ttk.Frame(root)
         marks.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -1706,13 +1800,13 @@ class App(tk.Tk):
         self._rel_label = tk.StringVar()
         self._abs_label = tk.StringVar()
 
-        self._option_label(self._dyn_frame, "Min spacing", "min_gap").grid(
+        self._option_label(self._dyn_frame, "Label clearance", "min_gap").grid(
             row=0, column=0, sticky="w", **pad
         )
         self._gap_scale = ttk.Scale(
             self._dyn_frame,
-            from_=1.0,
-            to=12.0,
+            from_=0.0,
+            to=4.0,
             variable=self.min_gap,
             command=lambda _v: self._on_slider(),
         )
@@ -1752,7 +1846,7 @@ class App(tk.Tk):
         )
         ttk.Label(
             self._dyn_frame,
-            text="Higher spacing / deltas → fewer marks.",
+            text="Clearance is on top of measured label widths. Higher clearance / deltas → fewer marks.",
             foreground="#666",
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
@@ -2054,6 +2148,8 @@ class App(tk.Tk):
         for var in (
             self.text_color,
             self.tick_color,
+            self.tick_height,
+            self.tick_width,
             self.stripe_color,
             self.font_name,
             self.font_size,
@@ -2100,6 +2196,14 @@ class App(tk.Tk):
         if font_size < 1:
             raise ValueError("Font size must be ≥ 1")
 
+        try:
+            tick_height = float(self.tick_height.get().strip())
+            tick_width = float(self.tick_width.get().strip())
+        except ValueError as e:
+            raise ValueError("Tick height/width must be numbers (mm)") from e
+        if tick_height <= 0 or tick_width <= 0:
+            raise ValueError("Tick height/width must be > 0 mm")
+
         return FocusingScaleGenerator(
             focal_length=num("focal"),
             diameter=num("diameter"),
@@ -2114,7 +2218,8 @@ class App(tk.Tk):
             min_rel=float(self.min_rel.get()) / 100.0,
             min_abs_m=float(self.min_abs.get()),
             dpi=300,
-            tick_length=0.5,
+            tick_length=tick_height,
+            tick_width=tick_width,
             padding=0.3,
             vertical_offset=0.5,
             target_distances=distances,
