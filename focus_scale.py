@@ -500,12 +500,26 @@ class FocusingScaleGenerator:
                 f"circumference ({self.circumference:.2f} mm)"
             )
         self.wrap_segment_mm = self.circumference - self.wrap_buffer_mm
+        # Physical helicoid travel (retract → full extension)
         self.throw_arc = self.circumference * throw_deg / 360.0
+        if max_extension <= 0:
+            raise ValueError("Helicoid extension must be > 0 mm")
+        self.arc_per_mm = self.throw_arc / max_extension
+        # Positive error: infinity lies before retract. Print a pre-buffer so ∞
+        # and far marks remain on the strip; align helicoid retract to retract_x.
+        self.scale_ext_min = -max(0.0, self.error)
+        self.pre_buffer_arc = -self.scale_ext_min * self.arc_per_mm
+        self.retract_x = self.pre_buffer_arc
+        self.scale_length = (
+            self.max_extension - self.scale_ext_min
+        ) * self.arc_per_mm
         self.last_scale_factor = 1.0
         self.last_landscape = False
         self.last_row_count = 1
         self.last_page_count = 1
-        self.last_wrap_count = max(1, int(math.ceil(self.throw_arc / self.wrap_segment_mm)))
+        self.last_wrap_count = max(
+            1, int(math.ceil(self.scale_length / self.wrap_segment_mm))
+        )
 
     # --- optics (error shifts the infinity position) ---
 
@@ -534,12 +548,20 @@ class FocusingScaleGenerator:
         delta = (self.focal_length**2) / denominator
         return self.infinity_extension() + delta
 
+    def _extension_on_scale(self, extension: float) -> bool:
+        """True if this helicoid extension falls on the printed strip."""
+        return self.scale_ext_min - 1e-9 <= extension <= self.max_extension + 1e-9
+
+    def _x_from_extension(self, extension: float) -> float:
+        """Scale X (mm from strip start) for a helicoid extension."""
+        return (extension - self.scale_ext_min) * self.arc_per_mm
+
     def _x_for_distance(self, distance_m: float) -> Optional[float]:
-        """Scale position (mm) for a focus distance, or None if out of throw."""
+        """Scale position (mm) for a focus distance, or None if off the strip."""
         extension = self.extension_from_object_distance(distance_m)
-        if extension is None or extension < 0 or extension > self.max_extension:
+        if extension is None or not self._extension_on_scale(extension):
             return None
-        return (extension / self.max_extension) * self.throw_arc
+        return self._x_from_extension(extension)
 
     def _nice_distance_candidates(self, near_m: float, far_m: float) -> list[float]:
         """
@@ -570,7 +592,8 @@ class FocusingScaleGenerator:
         near_m = self.object_distance_from_extension(self.max_extension)
         if near_m == float("inf"):
             return []
-        far_m = self.object_distance_from_extension(0.0)
+        # Far end of the *printed* strip (∞ when positive error adds a pre-buffer)
+        far_m = self.object_distance_from_extension(self.scale_ext_min)
 
         # Tunable thresholds (GUI sliders)
         min_gap_mm = self.min_gap_mm
@@ -584,9 +607,9 @@ class FocusingScaleGenerator:
         # Reserve space for infinity (if present) and the terminal tip
         e_inf = self.infinity_extension()
         reserved: list[float] = []
-        if 0 <= e_inf <= self.max_extension:
-            reserved.append((e_inf / self.max_extension) * self.throw_arc)
-        reserved.append(self.throw_arc)
+        if self._extension_on_scale(e_inf):
+            reserved.append(self._x_from_extension(e_inf))
+        reserved.append(self.scale_length)
 
         for d in sorted(candidates, reverse=True):  # far → near
             x = self._x_for_distance(d)
@@ -622,20 +645,19 @@ class FocusingScaleGenerator:
         distances: list[float] = []
 
         e_inf = self.infinity_extension()
-        if 0 <= e_inf <= self.max_extension:
-            positions.append((e_inf / self.max_extension) * self.throw_arc)
+        if self._extension_on_scale(e_inf):
+            positions.append(self._x_from_extension(e_inf))
             distances.append(float("inf"))
 
         for distance in self._mark_distances():
             extension = self.extension_from_object_distance(distance)
-            if extension is None:
+            if extension is None or not self._extension_on_scale(extension):
                 continue
-            if 0 <= extension <= self.max_extension:
-                x = (extension / self.max_extension) * self.throw_arc
-                if any(abs(x - p) < 0.25 for p in positions):
-                    continue
-                positions.append(x)
-                distances.append(distance)
+            x = self._x_from_extension(extension)
+            if any(abs(x - p) < 0.25 for p in positions):
+                continue
+            positions.append(x)
+            distances.append(distance)
 
         # Always put a terminal mark at full extension (rounded to 0.01 m)
         near_m = self.object_distance_from_extension(self.max_extension)
@@ -644,12 +666,12 @@ class FocusingScaleGenerator:
             kept_p: list[float] = []
             kept_d: list[float] = []
             for p, d in zip(positions, distances):
-                if p < self.throw_arc - 1.0:
+                if p < self.scale_length - 1.0:
                     kept_p.append(p)
                     kept_d.append(d)
             positions = kept_p
             distances = kept_d
-            positions.append(self.throw_arc)
+            positions.append(self.scale_length)
             distances.append(end_m)
 
         order = sorted(zip(positions, distances), key=lambda t: t[0])
@@ -726,13 +748,45 @@ class FocusingScaleGenerator:
             draw.text((text_x, text_y), text, fill=self.text_color, font=font)
 
     def create_scale(self) -> Image.Image:
-        """Full continuous scale strip at 1:1 (width = throw arc)."""
-        width_mm = self.throw_arc
+        """Full continuous scale strip at 1:1 (width = printed scale length)."""
+        width_mm = self.scale_length
         width_px = self._mm_to_pixels(width_mm)
         height_px = self._mm_to_pixels(self.height)
 
         img = Image.new("RGB", (width_px, height_px), "black")
         draw = ImageDraw.Draw(img)
+
+        # Unreachable pre-buffer (positive error): faint hatch + dotted retract line.
+        # Align helicoid retract to the dotted boundary.
+        if self.pre_buffer_arc > 0.05:
+            pre_px = min(width_px, self._mm_to_pixels(self.pre_buffer_arc))
+            if pre_px > 0:
+                # ~30% opacity white diagonal stripes over black
+                hatch = Image.new("RGBA", (pre_px, height_px), (0, 0, 0, 0))
+                hdraw = ImageDraw.Draw(hatch)
+                stripe = (255, 255, 255, int(round(255 * 0.30)))
+                step = max(3, self._mm_to_pixels(1.2))
+                line_w = max(1, self._mm_to_pixels(0.25))
+                for i in range(-height_px * 2, pre_px + height_px * 2, step):
+                    hdraw.line(
+                        [(i, 0), (i + height_px, height_px)],
+                        fill=stripe,
+                        width=line_w,
+                    )
+                base = img.convert("RGBA")
+                overlay = Image.new("RGBA", (width_px, height_px), (0, 0, 0, 0))
+                overlay.paste(hatch, (0, 0))
+                img = Image.alpha_composite(base, overlay).convert("RGB")
+                draw = ImageDraw.Draw(img)
+            rx = min(width_px - 1, self._mm_to_pixels(self.retract_x))
+            dash = max(2, self._mm_to_pixels(0.45))
+            gap = max(1, self._mm_to_pixels(0.35))
+            y = 0
+            while y < height_px:
+                y_end = min(height_px - 1, y + dash - 1)
+                draw.line([(rx, y), (rx, y_end)], fill=self.tick_color, width=1)
+                y = y_end + 1 + gap
+
         font = self._load_font(self.font_size)
 
         x_positions, distances = self._calculate_scale_positions()
@@ -757,7 +811,7 @@ class FocusingScaleGenerator:
         Returns (landscape, content_mm_per_row, row_count).
         Rows break for page width and at each helicoid circumference − wrap buffer.
         """
-        strip_w = self.throw_arc
+        strip_w = self.scale_length
         row_h = self.height
         wrap_seg = self.wrap_segment_mm
 
@@ -793,7 +847,7 @@ class FocusingScaleGenerator:
         margin_px = self._mm_to_pixels(PAGE_MARGIN_MM)
         usable = page_w - 2 * margin_px
         if not multi_row:
-            return min(self._mm_to_pixels(self.throw_arc), usable)
+            return min(self._mm_to_pixels(self.scale_length), usable)
         left_px = self._mm_to_pixels(max(LEFT_LABEL_MM, WRAP_MARKER_MM + WRAP_GAP_MM))
         right_px = self._mm_to_pixels(max(STRIPE_MM, WRAP_MARKER_MM + WRAP_GAP_MM))
         return max(1, usable - left_px - right_px)
@@ -994,7 +1048,7 @@ class FocusingScaleGenerator:
         self.last_scale_factor = 1.0
         self.last_landscape = landscape
 
-        multi = _plan_rows > 1 or self.throw_arc > self.wrap_segment_mm + 1e-6
+        multi = _plan_rows > 1 or self.scale_length > self.wrap_segment_mm + 1e-6
         page_content_px = self._content_px_for_page(landscape, multi)
         # Also cap by wrap segment
         wrap_px = max(1, self._mm_to_pixels(self.wrap_segment_mm))
@@ -1004,7 +1058,7 @@ class FocusingScaleGenerator:
         row_count = len(segments)
         self.last_row_count = row_count
         self.last_wrap_count = max(
-            1, int(math.ceil(self.throw_arc / self.wrap_segment_mm))
+            1, int(math.ceil(self.scale_length / self.wrap_segment_mm))
         )
 
         page_w_mm, page_h_mm = self._page_dims_mm(landscape)
@@ -1051,7 +1105,7 @@ class FocusingScaleGenerator:
         if scale_px_accounted != strip.width:
             raise RuntimeError(
                 f"Scale length not preserved: accounted {scale_px_accounted}px "
-                f"of {strip.width}px ({self.throw_arc:.3f} mm)"
+                f"of {strip.width}px ({self.scale_length:.3f} mm)"
             )
 
 
@@ -1177,10 +1231,13 @@ class FocusingScaleGenerator:
 
     def preview_summary(self) -> str:
         near = self.object_distance_from_extension(self.max_extension)
-        far = self.object_distance_from_extension(0.0)
+        far_retract = self.object_distance_from_extension(0.0)
+        far_strip = self.object_distance_from_extension(self.scale_ext_min)
         e_inf = self.infinity_extension()
         near_s = "∞" if near == float("inf") else f"{near:.3f} m"
-        far_s = "∞ / past ∞" if far == float("inf") else f"{far:.3f} m"
+        far_retract_s = (
+            "∞ / past ∞" if far_retract == float("inf") else f"{far_retract:.3f} m"
+        )
 
         landscape, content_mm, row_count = self._layout_plan()
         orient = "landscape" if landscape else "portrait"
@@ -1195,14 +1252,21 @@ class FocusingScaleGenerator:
 
         wraps = max(0, self.last_wrap_count - 1)
         lines = [
-            f"Scale length: {self.throw_arc:.2f} mm "
+            f"Throw arc: {self.throw_arc:.2f} mm "
             f"({self.throw_deg:g}° / 360 of Ø{self.diameter:g})",
+            f"Printed length: {self.scale_length:.2f} mm "
+            f"({self.scale_length:.2f} × {self.height:g} mm @ {self.dpi} DPI)",
             f"Circumference: {self.circumference:.2f} mm · "
             f"wrap every {self.wrap_segment_mm:.2f} mm "
             f"(buffer {self.wrap_buffer_mm:g} mm)",
-            f"Strip: {self.throw_arc:.2f} × {self.height:g} mm @ {self.dpi} DPI",
             f"PDF page: {page_note}",
         ]
+        if self.pre_buffer_arc > 0.05:
+            lines.append(
+                f"Pre-buffer: {self.pre_buffer_arc:.2f} mm "
+                f"(align helicoid retract to the dotted line; "
+                f"∞ and farther marks are visible but unreachable)"
+            )
         if wraps:
             lines.append(
                 f"Wraps: {wraps} forced break{'s' if wraps != 1 else ''} "
@@ -1212,17 +1276,22 @@ class FocusingScaleGenerator:
             [
                 f"Mark mode: {self.mark_mode} · "
                 f"{len(self._calculate_scale_positions()[0])} marks",
-                f"Focus at travel: {near_s} ← → {far_s}",
+                f"Focus at helicoid travel: {near_s} ← → {far_retract_s}",
             ]
         )
         if 0 <= e_inf <= self.max_extension:
             lines.append(f"Infinity at {e_inf:.2f} mm extension")
         elif e_inf < 0:
             lines.append(
-                f"Infinity {-e_inf:.2f} mm before retract (positive error → no ∞)"
+                f"Infinity {-e_inf:.2f} mm before retract "
+                f"(printed in pre-buffer; unreachable)"
             )
         else:
             lines.append(f"Infinity at {e_inf:.2f} mm (beyond throw)")
+        if far_strip == float("inf") and far_retract != float("inf"):
+            lines.append(
+                f"Focus at retract: {far_retract_s} · strip still shows ∞"
+            )
         if self.ffd:
             lines.append(
                 f"FFD {self.ffd:g} mm + error {self.error:+g} mm "
@@ -1314,8 +1383,10 @@ OPTION_INFO = {
     ),
     "error": (
         "Axial mounting error (mm).\n\n"
-        "Positive: helicoid sits too far from the film → infinity is "
-        "unreachable (retract focuses closer than ∞).\n"
+        "Positive: helicoid sits too far from the film → infinity is before "
+        "retract (unreachable). The scale adds a pre-buffer that still prints ∞ "
+        "and far marks; align the helicoid’s retract to the dotted vertical "
+        "line so those marks stay visible but unused.\n"
         "Negative: helicoid sits too close → infinity is partway into the throw.\n"
         "Zero: infinity at full retract."
     ),
@@ -2089,10 +2160,15 @@ class App(tk.Tk):
         near_s = "∞" if near == float("inf") else f"{near:.2f} m"
         wraps = max(0, gen.last_wrap_count - 1)
         wrap_bit = f" · {wraps} wrap{'s' if wraps != 1 else ''}" if wraps else ""
+        pre_bit = (
+            f" · pre-buffer {gen.pre_buffer_arc:.1f} mm"
+            if gen.pre_buffer_arc > 0.05
+            else ""
+        )
         self.status.set(
-            f"{gen.throw_arc:.1f} mm × {gen.height:g} mm @ 300 DPI · "
+            f"{gen.scale_length:.1f} mm × {gen.height:g} mm @ 300 DPI · "
             f"{n_marks} marks · mode={gen.mark_mode} · near={near_s}"
-            f"{wrap_bit} · zoom {zoom * 100:.0f}% (uniform)"
+            f"{pre_bit}{wrap_bit} · zoom {zoom * 100:.0f}% (uniform)"
         )
 
     def save_scale(self) -> None:

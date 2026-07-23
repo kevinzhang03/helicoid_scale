@@ -40,7 +40,7 @@ Throw may exceed 360° for multi-turn helicoids.
 
 - With **error = 0**, infinity is at full retract.
 - Extension past infinity: \(\delta = f^2 / (u - f)\), where \(u\) is object distance and \(f\) is focal length.
-- **Positive error**: helicoid sits too far from the film/sensor → infinity is unreachable (retract focuses closer than ∞).
+- **Positive error**: helicoid sits too far from the film/sensor → infinity lies before retract (unreachable). The printed scale adds a **pre-buffer** (faint hatch + dotted boundary) that still includes ∞ and far marks; align the helicoid’s retract to the dotted line so those marks stay visible but unused.
 - **Negative error**: infinity falls partway into the throw.
 - **FFD** (focal flange distance) is recorded on the PDF for reference; mark positions are driven by focal length, extension, and error.
 
